@@ -118,6 +118,21 @@ config LEDS_ARIEL
 
 	  Say Y to if your machine is a Dell Wyse 3020 thin client.
 
+config LEDS_ASUS_AURA_SCSI
+	tristate "LED support for ASUS ROG Aura SCSI external enclosures"
+	depends on SCSI
+	depends on LEDS_CLASS_DYNAMIC
+	help
+	  This option enables support for the addressable Aura RGB LEDs on
+	  ASUS ROG external NVMe enclosures (such as the ROG STRIX Arion,
+	  USB ID 0b05:1932).
+
+	  The LEDs are driven through vendor SCSI commands to an onboard ENE
+	  microcontroller and exposed via the Dynamic Lighting LED class interface.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called leds-asus-aura-scsi.
+
 config LEDS_OSRAM_AMS_AS3668
 	tristate "LED support for Osram AMS AS3668"
 	depends on LEDS_CLASS
