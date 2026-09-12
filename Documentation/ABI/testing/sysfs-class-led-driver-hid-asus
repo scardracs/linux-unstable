@@ -1,0 +1,9 @@
+What:		/sys/class/leds/<led>/aura_mode
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		ASUS Aura topology mode on hid-asus Dynamic Lighting nodes.
+		One of "auto", "unified", or "split". In unified mode only the
+		global node accepts effect/direct writes; in split mode the
+		keyboard and lightbar nodes are independent and the global
+		node returns -EBUSY.
