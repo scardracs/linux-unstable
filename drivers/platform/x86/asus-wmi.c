@@ -26,6 +26,7 @@
 #include <linux/input/sparse-keymap.h>
 #include <linux/kernel.h>
 #include <linux/leds.h>
+#include <linux/led-dynamic-lighting.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -255,6 +256,9 @@ struct asus_wmi {
 	struct led_classdev tpd_led;
 	int tpd_led_wk;
 	struct led_classdev kbd_led;
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	struct led_classdev_dynamic kbd_dldev;
+#endif
 	int kbd_led_wk;
 	bool kbd_led_notify;
 	bool kbd_led_avail;
@@ -1046,21 +1050,211 @@ static ssize_t gpu_mux_mode_store(struct device *dev,
 static DEVICE_ATTR_RW(gpu_mux_mode);
 #endif /* IS_ENABLED(CONFIG_ASUS_WMI_DEPRECATED_ATTRS) */
 
+static inline struct asus_wmi *asus_from_kbd_led(struct led_classdev *led_cdev)
+{
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (is_dynamic_lighting_led(led_cdev))
+		return lcdev_to_dldev(led_cdev)->driver_data;
+#endif
+	return container_of(led_cdev, struct asus_wmi, kbd_led);
+}
+
+static inline struct led_classdev *asus_kbd_led_cdev(struct asus_wmi *asus)
+{
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (asus->kbd_rgb_dev)
+		return &asus->kbd_dldev.cdev;
+#endif
+	return &asus->kbd_led;
+}
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+#define ASUS_TUF_SUPPORTED_EFFECTS (BIT(DL_EFFECT_OFF) | \
+				    BIT(DL_EFFECT_STATIC) | \
+				    BIT(DL_EFFECT_BREATHING) | \
+				    BIT(DL_EFFECT_SPECTRUM_CYCLE) | \
+				    BIT(DL_EFFECT_RAINBOW) | \
+				    BIT(DL_EFFECT_STROBE))
+
+static u8 dl_to_tuf_mode(enum dl_effect_mode mode)
+{
+	switch (mode) {
+	case DL_EFFECT_STATIC:
+		return 0;
+	case DL_EFFECT_BREATHING:
+		return 1;
+	case DL_EFFECT_SPECTRUM_CYCLE:
+		return 2;
+	case DL_EFFECT_RAINBOW:
+		return 3;
+	case DL_EFFECT_STROBE:
+		return 10;
+	case DL_EFFECT_OFF:
+	default:
+		return 0;
+	}
+}
+
+static enum dl_effect_mode tuf_mode_to_dl(u8 mode)
+{
+	switch (mode) {
+	case 1:
+		return DL_EFFECT_BREATHING;
+	case 2:
+		return DL_EFFECT_SPECTRUM_CYCLE;
+	case 3:
+		return DL_EFFECT_RAINBOW;
+	case 10:
+		return DL_EFFECT_STROBE;
+	case 0:
+	default:
+		return DL_EFFECT_STATIC;
+	}
+}
+
+static int asus_tuf_rgb_update_hardware(struct asus_wmi *asus)
+{
+	struct led_classdev_dynamic *ldev = &asus->kbd_dldev;
+	u8 mode;
+	u8 r = 0, g = 0, b = 0;
+	u8 speed_val = 0xeb;
+	int err;
+
+	if (ldev->current_effect != DL_EFFECT_OFF &&
+	    ldev->palette && ldev->num_palette_entries > 0) {
+		r = ldev->palette[0].r;
+		g = ldev->palette[0].g;
+		b = ldev->palette[0].b;
+	}
+
+	mode = dl_to_tuf_mode(ldev->current_effect);
+
+	switch (ldev->speed) {
+	case 0:
+		speed_val = 0xe1;
+		break;
+	case 1:
+		speed_val = 0xeb;
+		break;
+	case 2:
+		speed_val = 0xf5;
+		break;
+	default:
+		speed_val = 0xeb;
+		break;
+	}
+
+	err = asus_wmi_evaluate_method3(ASUS_WMI_METHODID_DEVS, asus->kbd_rgb_dev,
+					0xb3 | (mode << 8) | (r << 16) | (g << 24),
+					b | (speed_val << 8), NULL);
+	if (err)
+		return err;
+
+	return asus_wmi_evaluate_method3(ASUS_WMI_METHODID_DEVS, asus->kbd_rgb_dev,
+					 0xb4 | (mode << 8) | (r << 16) | (g << 24),
+					 b | (speed_val << 8), NULL);
+}
+
+static int asus_tuf_rgb_set_effect(struct led_classdev_dynamic *ldev,
+				   enum dl_effect_mode mode)
+{
+	struct asus_wmi *asus = ldev->driver_data;
+	enum dl_effect_mode old = ldev->current_effect;
+	int err;
+
+	ldev->current_effect = mode;
+	err = asus_tuf_rgb_update_hardware(asus);
+	ldev->current_effect = old;
+	return err;
+}
+
+static int asus_tuf_rgb_set_speed(struct led_classdev_dynamic *ldev,
+				  unsigned int speed)
+{
+	struct asus_wmi *asus = ldev->driver_data;
+	unsigned int old = ldev->speed;
+	int err;
+
+	if (speed > ldev->max_speed)
+		return -EINVAL;
+
+	ldev->speed = speed;
+	err = asus_tuf_rgb_update_hardware(asus);
+	ldev->speed = old;
+	return err;
+}
+
+static int asus_tuf_rgb_set_palette(struct led_classdev_dynamic *ldev,
+				    const struct dl_rgb *palette,
+				    unsigned int num_entries)
+{
+	struct asus_wmi *asus = ldev->driver_data;
+	struct dl_rgb old_color;
+	unsigned int old_n = ldev->num_palette_entries;
+	int err;
+
+	if (!num_entries || !palette)
+		return -EINVAL;
+
+	old_color = ldev->palette[0];
+	ldev->palette[0] = palette[0];
+	ldev->num_palette_entries = 1;
+
+	err = asus_tuf_rgb_update_hardware(asus);
+
+	ldev->palette[0] = old_color;
+	ldev->num_palette_entries = old_n;
+	return err;
+}
+
+static int asus_tuf_rgb_set_power_states(struct led_classdev_dynamic *ldev,
+					 u32 active_states)
+{
+	struct asus_wmi *asus = ldev->driver_data;
+	u32 flags = BIT(7);
+
+	if (!asus->kbd_rgb_state_available)
+		return 0;
+
+	if (active_states & BIT(DL_POWER_STATE_BOOT))
+		flags |= BIT(1);
+	if (active_states & BIT(DL_POWER_STATE_AWAKE))
+		flags |= BIT(3);
+	if (active_states & BIT(DL_POWER_STATE_SLEEP))
+		flags |= BIT(5);
+
+	return asus_wmi_evaluate_method3(ASUS_WMI_METHODID_DEVS,
+					 ASUS_WMI_DEVID_TUF_RGB_STATE,
+					 0xbd | (BIT(2) << 8) | (flags << 16), 0, NULL);
+}
+
+static const struct led_dynamic_ops asus_tuf_rgb_ops = {
+	.set_effect	= asus_tuf_rgb_set_effect,
+	.set_speed	= asus_tuf_rgb_set_speed,
+	.set_palette	= asus_tuf_rgb_set_palette,
+	.set_power_states = asus_tuf_rgb_set_power_states,
+};
+#endif
+
 /* TUF Laptop Keyboard RGB Modes **********************************************/
 static ssize_t kbd_rgb_mode_store(struct device *dev,
 				 struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	u32 cmd, mode, r, g, b, speed;
+	u32 cmd, mode, r, g, b, speed, speed_level;
 	struct led_classdev *led;
 	struct asus_wmi *asus;
 	int err;
 
 	led = dev_get_drvdata(dev);
-	asus = container_of(led, struct asus_wmi, kbd_led);
+	asus = asus_from_kbd_led(led);
 
 	if (sscanf(buf, "%d %d %d %d %d %d", &cmd, &mode, &r, &g, &b, &speed) != 6)
 		return -EINVAL;
+
+	speed_level = speed;
+	if (speed_level > 2)
+		speed_level = 1;
 
 	/* B3 is set and B4 is save to BIOS */
 	switch (cmd) {
@@ -1097,6 +1291,22 @@ static ssize_t kbd_rgb_mode_store(struct device *dev,
 	if (err)
 		return err;
 
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (is_dynamic_lighting_led(led)) {
+		struct led_classdev_dynamic *ldev = lcdev_to_dldev(led);
+
+		guard(mutex)(&ldev->lock);
+		if (ldev->palette) {
+			ldev->palette[0].r = r;
+			ldev->palette[0].g = g;
+			ldev->palette[0].b = b;
+			ldev->num_palette_entries = 1;
+		}
+		ldev->speed = speed_level;
+		ldev->current_effect = tuf_mode_to_dl(mode);
+	}
+#endif
+
 	return count;
 }
 static DEVICE_ATTR_WO(kbd_rgb_mode);
@@ -1120,6 +1330,7 @@ static ssize_t kbd_rgb_state_store(struct device *dev,
 				 const char *buf, size_t count)
 {
 	u32 flags, cmd, boot, awake, sleep, keyboard;
+	struct led_classdev *led;
 	int err;
 
 	if (sscanf(buf, "%d %d %d %d %d", &cmd, &boot, &awake, &sleep, &keyboard) != 5)
@@ -1143,6 +1354,24 @@ static ssize_t kbd_rgb_state_store(struct device *dev,
 			ASUS_WMI_DEVID_TUF_RGB_STATE, 0xbd | cmd << 8 | (flags << 16), 0, NULL);
 	if (err)
 		return err;
+
+	led = dev_get_drvdata(dev);
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (is_dynamic_lighting_led(led)) {
+		struct led_classdev_dynamic *ldev = lcdev_to_dldev(led);
+		u32 states = 0;
+
+		if (boot)
+			states |= BIT(DL_POWER_STATE_BOOT);
+		if (awake)
+			states |= BIT(DL_POWER_STATE_AWAKE);
+		if (sleep)
+			states |= BIT(DL_POWER_STATE_SLEEP);
+
+		guard(mutex)(&ldev->lock);
+		ldev->active_power_states = states;
+	}
+#endif
 
 	return count;
 }
@@ -1772,9 +2001,31 @@ static void kbd_led_update_all(struct work_struct *work)
 		 * completed and asus-wmi will keep running until it finishes.
 		 * Therefore, we can safely register the LED without holding
 		 * a spinlock.
+		 *
+		 * Guard against a NULL cdev.name: registration can be queued
+		 * for HID listeners even when WMI kbd backlight setup was
+		 * skipped; led_classdev_register_ext() strnlen()s the name.
 		 */
-		ret = devm_led_classdev_register(&asus->platform_device->dev,
-						 &asus->kbd_led);
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+		if (asus->kbd_rgb_dev) {
+			if (!asus->kbd_dldev.cdev.name)
+				asus->kbd_dldev.cdev.name = "asus::kbd_backlight";
+			ret = devm_led_classdev_dynamic_register(&asus->platform_device->dev,
+								 &asus->kbd_dldev);
+			if (!ret && asus->kbd_dldev.palette) {
+				asus->kbd_dldev.palette[0].r = 255;
+				asus->kbd_dldev.palette[0].g = 255;
+				asus->kbd_dldev.palette[0].b = 255;
+				asus->kbd_dldev.num_palette_entries = 1;
+			}
+		} else
+#endif
+		{
+			if (!asus->kbd_led.name)
+				asus->kbd_led.name = "asus::kbd_backlight";
+			ret = devm_led_classdev_register(&asus->platform_device->dev,
+							 &asus->kbd_led);
+		}
 		if (!ret) {
 			scoped_guard(spinlock_irqsave, &asus_ref.lock)
 				asus->kbd_led_registered = true;
@@ -1785,11 +2036,11 @@ static void kbd_led_update_all(struct work_struct *work)
 	}
 
 	if (value >= 0)
-		do_kbd_led_set(&asus->kbd_led, value);
+		do_kbd_led_set(asus_kbd_led_cdev(asus), value);
 	if (notify) {
 		scoped_guard(spinlock_irqsave, &asus_ref.lock)
 			asus->kbd_led_notify = false;
-		led_classdev_notify_brightness_hw_changed(&asus->kbd_led, value);
+		led_classdev_notify_brightness_hw_changed(asus_kbd_led_cdev(asus), value);
 	}
 }
 
@@ -1914,7 +2165,7 @@ static void do_kbd_led_set(struct led_classdev *led_cdev, int value)
 	struct asus_hid_listener *listener;
 	struct asus_wmi *asus;
 
-	asus = container_of(led_cdev, struct asus_wmi, kbd_led);
+	asus = asus_from_kbd_led(led_cdev);
 
 	scoped_guard(spinlock_irqsave, &asus_ref.lock)
 		asus->kbd_led_wk = clamp_val(value, 0, ASUS_EV_MAX_BRIGHTNESS);
@@ -1952,7 +2203,7 @@ static enum led_brightness kbd_led_get(struct led_classdev *led_cdev)
 	struct asus_wmi *asus;
 	int retval, value;
 
-	asus = container_of(led_cdev, struct asus_wmi, kbd_led);
+	asus = asus_from_kbd_led(led_cdev);
 
 	scoped_guard(spinlock_irqsave, &asus_ref.lock) {
 		if (!asus->kbd_led_avail)
@@ -2117,18 +2368,61 @@ static int asus_wmi_led_init(struct asus_wmi *asus)
 			goto error;
 	}
 
-	asus->kbd_led.name = "asus::kbd_backlight";
-	asus->kbd_led.flags = LED_BRIGHT_HW_CHANGED;
-	asus->kbd_led.brightness_set_blocking = kbd_led_set;
-	asus->kbd_led.brightness_get = kbd_led_get;
-	asus->kbd_led.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
+	/*
+	 * Always initialize kbd_led (or TUF DL cdev) before queueing work.
+	 * Registration can run for HID listeners even when WMI kbd backlight
+	 * is absent (kbd_led_avail == false); a NULL cdev.name oopses in
+	 * led_classdev_register_ext() via strnlen().
+	 */
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (asus->kbd_rgb_dev) {
+		struct led_classdev_dynamic *dldev = &asus->kbd_dldev;
+
+		dldev->cdev.name = "asus::kbd_backlight";
+		dldev->cdev.flags = LED_BRIGHT_HW_CHANGED;
+		dldev->cdev.brightness_set_blocking = kbd_led_set;
+		dldev->cdev.brightness_get = kbd_led_get;
+		dldev->cdev.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
+		dldev->ops = &asus_tuf_rgb_ops;
+		dldev->driver_data = asus;
+		dldev->zone_type = "keyboard";
+		dldev->led_count = 1;
+		dldev->speed = 1;
+		dldev->max_speed = 2;
+		dldev->max_palette_entries = 1;
+		dldev->current_effect = DL_EFFECT_STATIC;
+		dldev->supported_effects = ASUS_TUF_SUPPORTED_EFFECTS;
+		if (asus->kbd_rgb_state_available) {
+			dldev->supported_power_states =
+				BIT(DL_POWER_STATE_BOOT) |
+				BIT(DL_POWER_STATE_AWAKE) |
+				BIT(DL_POWER_STATE_SLEEP);
+			dldev->active_power_states =
+				dldev->supported_power_states;
+		}
+	} else
+#endif
+	{
+		asus->kbd_led.name = "asus::kbd_backlight";
+		asus->kbd_led.flags = LED_BRIGHT_HW_CHANGED;
+		asus->kbd_led.brightness_set_blocking = kbd_led_set;
+		asus->kbd_led.brightness_get = kbd_led_get;
+		asus->kbd_led.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
+	}
+
 	asus->kbd_led_avail = !kbd_led_read(asus, &led_val, NULL);
 	INIT_WORK(&asus->kbd_led_work, kbd_led_update_all);
 
 	if (asus->kbd_led_avail) {
 		asus->kbd_led_wk = led_val;
-		if (num_rgb_groups != 0)
-			asus->kbd_led.groups = kbd_rgb_mode_groups;
+		if (num_rgb_groups != 0) {
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+			if (asus->kbd_rgb_dev)
+				asus->kbd_dldev.cdev.groups = kbd_rgb_mode_groups;
+			else
+#endif
+				asus->kbd_led.groups = kbd_rgb_mode_groups;
+		}
 	} else {
 		asus->kbd_led_wk = -1;
 	}
@@ -5336,7 +5630,7 @@ static int asus_hotk_resume(struct device *device)
 {
 	struct asus_wmi *asus = dev_get_drvdata(device);
 
-	if (!IS_ERR_OR_NULL(asus->kbd_led.dev))
+	if (!IS_ERR_OR_NULL(asus_kbd_led_cdev(asus)->dev))
 		kbd_led_update(asus);
 
 	if (asus_wmi_has_fnlock_key(asus))
@@ -5377,7 +5671,7 @@ static int asus_hotk_restore(struct device *device)
 		bl = !asus_wmi_get_devstate_simple(asus, ASUS_WMI_DEVID_UWB);
 		rfkill_set_sw_state(asus->uwb.rfkill, bl);
 	}
-	if (!IS_ERR_OR_NULL(asus->kbd_led.dev))
+	if (!IS_ERR_OR_NULL(asus_kbd_led_cdev(asus)->dev))
 		kbd_led_update(asus);
 	if (asus->oobe_state_available) {
 		/*

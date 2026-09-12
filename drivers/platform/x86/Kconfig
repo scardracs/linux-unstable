@@ -280,6 +280,7 @@ config ASUS_WMI
 	select LEDS_CLASS
 	select NEW_LEDS
 	select ACPI_PLATFORM_PROFILE
+	imply LEDS_CLASS_DYNAMIC
 	help
 	  Say Y here if you have a WMI aware Asus laptop (like Eee PCs or new
 	  Asus Notebooks).
