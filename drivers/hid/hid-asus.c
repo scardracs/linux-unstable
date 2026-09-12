@@ -2001,8 +2001,13 @@ static enum asus_aura_mode asus_aura_effective_mode(struct asus_drvdata *drvdata
 {
 	enum asus_aura_mode mode = READ_ONCE(drvdata->aura_mode);
 
+	/*
+	 * auto resolves to split: keyboard and lightbar (when present) stay
+	 * independently writable. Userspace can select unified for a single
+	 * global effect across zones.
+	 */
 	if (mode == AURA_MODE_AUTO)
-		return drvdata->has_lightbar ? AURA_MODE_UNIFIED : AURA_MODE_SPLIT;
+		return AURA_MODE_SPLIT;
 	return mode;
 }
 
