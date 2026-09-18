@@ -127,3 +127,6 @@ CONFIG_LOCALVERSION=""
 # hid-ayaneo (PR #3); mirrors OpenGamingCollective/kernel-packages#35, which
 # lands the option in the real OGC config once the driver merges.
 CONFIG_HID_AYANEO=m
+# leds-asus-aura-scsi: Aura RGB on ASUS ROG NVMe enclosures (ROG STRIX Arion).
+# LEDS_CLASS_DYNAMIC is already enabled in the merged OGC config.
+CONFIG_LEDS_ASUS_AURA_SCSI=m
